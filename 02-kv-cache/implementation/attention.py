@@ -53,22 +53,45 @@ class CachedCausalSelfAttention(nn.Module):
         new_k = self._split_heads(self.k_proj(x))
         new_v = self._split_heads(self.v_proj(x))
 
-        # TODO 1: If past_kv is present, concatenate past and new K/V along
-        # the sequence dimension (dim=2). Otherwise use new_k and new_v.
-        # Track past_len; it is zero during prefill and nonzero during decode.
+        # 1. Extend cached keys and values.
+        if past_kv is None:
+            past_len = 0
+            full_k = new_k
+            full_v = new_v
+        else:
+            past_k, past_v = past_kv
+            past_len = past_k.shape[2]
+            full_k = torch.cat((past_k, new_k), dim=2)
+            full_v = torch.cat((past_v, new_v), dim=2)
 
-        # TODO 2: Compute scaled scores with shape
-        # [batch, heads, query_len, past_len + query_len].
-        # Each query must attend to cached keys as well as allowed new keys.
+        # 2. Scaled dot-product attention scores.
+        scores = q @ full_k.transpose(-2, -1)
+        scores = scores / math.sqrt(self.head_dim)
 
-        # TODO 3: Build a causal mask from absolute positions:
-        # query positions: past_len ... past_len + query_len - 1
-        # key positions:   0 ... past_len + query_len - 1
-        # Mask locations where key_position > query_position.
+        # 3. Causal mask using absolute token positions.
+        key_len = past_len + query_len
 
-        # TODO 4: Apply softmax, multiply by the full value tensor, merge the
-        # heads, and apply out_proj.
+        query_positions = torch.arange(
+            past_len,
+            key_len,
+            device=x.device,
+        )
+        key_positions = torch.arange(
+            key_len,
+            device=x.device,
+        )
 
-        # TODO 5: Return (full_k, full_v) when use_cache is True, otherwise
-        # return None as the second tuple element.
-        raise NotImplementedError("Implement cached causal self-attention")
+        casual_mask = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
+        scores = scores.masked_fill(casual_mask, float("-inf"))
+
+        # 4. Attention output.
+        attention_probs = torch.softmax(scores, dim=-1)
+        attention_output = attention_probs @ full_v
+
+        attention_output = attention_output.transpose(1, 2).contiguous()
+        attention_output = attention_output.reshape(batch, query_len, self.dim)
+        output = self.out_proj(attention_output)
+
+        # 5. Return the updated cache when requested.
+        updated_cache = (full_k, full_v) if use_cache else None
+        return output, updated_cache
